@@ -1583,6 +1583,358 @@ all.json 的 key 前缀使用**单数形式**: `crate`, `agent`, `graffiti`, `co
 
 ---
 
+## cs2tradetool — 项目范式 (v2, 必须严格遵守)
+
+以下为 cs2tradetool 项目的完整架构与实现范式。**所有修改必须遵循此处定义
+的代码结构、数据流、命名约定和逻辑规则。** 此范式是经过 40+ 轮实战调试验证的
+最终版本。
+
+### 架构总览
+
+```
+cs2tradetool/
+├── index.js              ← 主程序: 登录/库存导出/汰换执行/模拟 (812行)
+│   数据流: Steam GC → CSOEconItem → CsgoResolver → processInventory → JSON
+├── generate_dict.js       ← 数据下载: all.json + items_game.txt + csgo_english.txt
+├── lib/
+│   ├── tradeup-sim.js    ← 汰换模拟器 (TradeUpSimulator 类, 纯算法)
+│   └── recipe-manager.js ← 配方管理 (RecipeManager 类, 持久化+验证)
+└── data/
+    ├── all.json          ← 单一数据源 (71MB, 45,756条, zh-CN)
+    ├── tokens.json       ← Refresh Token 持久化
+    └── game/
+        ├── items_game.txt    ← VDF 格式, 断层回退
+        └── csgo_english.txt  ← 英文翻译, 断层回退
+```
+
+### 铁律 (不可变更)
+
+1. **`def_index` 永远不是物品身份** — GC 中 `def_index=1209` 是通用贴纸容器,
+   `stickers[0].sticker_id` 才是真实身份。512 件物品共用 `def_index=1209` 但有
+   101 种不同 `sticker_id` 证实了这一点。
+2. **all.json 是唯一数据源** — 不允许多文件回退到旧的 CSGO-API 分散文件。
+3. **三路分派规则不可更改顺序** — `stickers[0]` → `paint_index` → `isWeapon`
+4. **类别搜索必须用单数形式** — `crate` 非 `crates`, 匹配 all.json key 前缀。
+5. **items_game.txt 断层回退不可移除** — 填补 CSGO-API 贴纸断层 (1695-1738 等)。
+6. **磨损输入必须校验合法性** — `wearFloat ∈ [minFloat, maxFloat]`, 否则拒绝。
+7. **产出磨损必须 clamp** — `outWear ∈ [outMin, outMax]`
+8. **ST/Souvenir 名称必须与 all.json 格式一致** —
+   `AK-47（StatTrak™）| 翔鹤`, `AK-47（纪念品）| 翔鹤`
+
+---
+
+### 模块 1: CsgoResolver — 物品解析器
+
+单一数据源 (all.json) + 断层回退。**范式代码 (不可改结构):**
+
+```js
+class CsgoResolver {
+  constructor() {
+    this._all = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'all.json'), 'utf8'));
+    this._allKeys = Object.keys(this._all);
+    this._buildIndexes();
+  }
+
+  _buildIndexes() {
+    this._skinByKey = {};    // "paint_index|weapon_id" → entry
+    this._stickerById = {};  // sticker_id → entry
+    this._byTypeAndDef = {}; // "type|def_index" → entry
+    this._weaponIds = new Set();
+
+    for (const key of this._allKeys) {
+      const item = this._all[key];
+      const type = key.split('-')[0];
+
+      if (type === 'skin' && item.paint_index && item.weapon?.weapon_id) {
+        this._skinByKey[`${item.paint_index}|${item.weapon.weapon_id}`] = item;
+        this._weaponIds.add(item.weapon.weapon_id);
+      }
+      if (type === 'sticker') {
+        this._stickerById[key.replace('sticker-', '')] = item;
+      }
+      if (item.def_index) {
+        (this._byTypeAndDef[type] ??= {})[item.def_index] = item;
+      }
+    }
+  }
+
+  resolveSkin(paintIndex, weaponId) {
+    return this._skinByKey[`${paintIndex}|${weaponId}`] || null;
+  }
+
+  resolveSticker(stickerId) {
+    if (this._stickerById[stickerId]) return this._stickerById[stickerId];
+    // 断层回退
+    if (gameDataFallback) {
+      const name = gameDataFallback.getStickerName(stickerId);
+      if (name) return { name: `印花 | ${name}`, _source: 'gamefile' };
+    }
+    return null;
+  }
+
+  resolveByDef(type, defIndex) {
+    return this._byTypeAndDef[type]?.[String(defIndex)] || null;
+  }
+
+  // 单数形式, 匹配 all.json key 前缀
+  getAllCategories() {
+    return ['crate', 'collectible', 'agent', 'music_kit', 'graffiti',
+            'patch', 'keychain', 'key', 'tool', 'sticker_slab'];
+  }
+
+  isKnownWeapon(defIndex) { return this._weaponIds.has(defIndex); }
+}
+```
+
+**items_game.txt 断层回退加载:**
+
+```js
+// VDF 解析 + csgo_english.txt 翻译
+const VDF = require('@node-steam/vdf');
+const gameVdf = VDF.parse(fs.readFileSync('data/game/items_game.txt', 'utf8'));
+this.stickerKits = gameVdf.items_game.sticker_kits;
+this.getStickerName = (id) => translate(this.stickerKits[id]?.item_name);
+```
+
+---
+
+### 模块 2: 三路分派 — GC 物品识别核心
+
+**此逻辑从 GC 原始 CSOEconItem 到最终名称, 顺序不可更改:**
+
+```
+CSOEconItem
+  │
+  ├─ hasAppliedSticker = item.stickers && item.stickers.length > 0
+  │   YES → 真实身份 = item.stickers[0].sticker_id
+  │         名称 = resolver.resolveSticker(stickerId)
+  │         失败 → "印花 #{stickerId}"
+  │
+  ├─ item.paint_index != null && item.paint_index !== 0
+  │   YES → 武器皮肤. Key = String(paint_index) + "|" + weapon_id
+  │         名称 = resolver.resolveSkin(paintIndex, weaponId)
+  │         磨损 = classifyWear(item.paint_wear)
+  │
+  ├─ resolver.isKnownWeapon(item.def_index)
+  │   YES → 原版武器 (无涂装)
+  │
+  └─ 否则 → 箱子/收藏品/探员/涂鸦
+           从 all.json 按类别精度计分:
+           10000 / categoryKeyCount — 条目越少权重越高
+           crate(478条)=20.9 >> sticker(10441条)=0.96
+```
+
+**类别精度计分表 (不可更改):**
+
+| 类别 | 条目数 | 精度分 |
+|------|-------|--------|
+| tool | 4 | 2500 |
+| key | 39 | 256 |
+| agent | 63 | 159 |
+| music_kit | 189 | 53 |
+| crate | 478 | 20.9 |
+| collectible | 627 | 15.9 |
+| graffiti | 2111 | 4.7 |
+| sticker/sticker_slab | 10441 | 0.96 |
+
+**StatTrak/Souvenir 检测与名称格式化 (不可更改):**
+
+检测逻辑 — 三重判断, 不是仅靠 `quality` 字段:
+```js
+const isST = item.quality === 9
+  || item.kill_eater_value != null
+  || (item.attribute || []).some(a => a.def_index === 80);
+
+const isSV = item.quality === 12
+  || (item.attribute || []).some(a => a.def_index === 140);
+if (isST) entry.stattrak = true;
+if (isSV) entry.souvenir = true;
+```
+
+名称格式化 — 与 all.json 格式严格一致:
+```js
+// ST: "AK-47 | 精英之作" → "AK-47（StatTrak™） | 精英之作"
+// SV: "AK-47 | 精英之作" → "AK-47（纪念品） | 精英之作"
+if (entry.name) {
+  if (isST) entry.name = entry.name.replace(/\s*\|\s*/, '（StatTrak™） | ');
+  if (isSV) entry.name = entry.name.replace(/\s*\|\s*/, '（纪念品） | ');
+}
+```
+
+杀敌数: `item.kill_eater_value != null` → `entry.stattrakKills = item.kill_eater_value`。
+
+---
+
+### 模块 3: TradeUpSimulator — 汰换模拟器
+
+文件: `lib/tradeup-sim.js`。纯算法, 不依赖 Steam/GC/I/O。
+
+**核心算法 (不可更改顺序和公式):**
+
+```
+simulate(items):
+  1. _resolveItem ×10          → 从 GC 解析皮肤元数据
+  2. _validate                 → 稀有度一致 + ST合法性 + wear ∈ [min,max]
+  3. norms = (wear-min)/(max-min) → clamp [0,1]
+  4. avgNorm = sum(norms) / 10
+  5. targetRarity = RARITY_ORDER[currentIdx + 1]
+  6. 集合分组: skin_id → collection → 输入物品分组
+  7. 产出计算:
+     for each (collection, items):
+       possibleOutputs = col.outputsByRarity[targetRarity]
+       inputRatio = items.length / 10
+       for each output:
+         prob = (inputRatio / possibleOutputs.length) × 100
+         outWear = avgNorm × (outMax - outMin) + outMin
+         clamp → [outMin, outMax]
+         name = skinMeta.name 去默认磨损 + 实际磨损后缀
+         if allST: name = name.replace(' | ', '（StatTrak™） | ')
+  8. sort by probability DESC
+```
+
+**Recipe (不可更改):**
+
+```js
+const RARITY_ORDER = ['消费级', '工业级', '军规级', '受限级', '保密级', '隐秘级'];
+const rarityToRecipe = { '消费级': 0, '工业级': 1, '军规级': 2, '受限级': 3, '保密级': 4 };
+// recipe = rarityToRecipe[当前稀有度];  if (allStatTrak) recipe += 10;
+```
+
+**名称格式化 (与 all.json 一致):**
+
+```js
+// 普通: "AK-47 | 翔鹤 (久经沙场)"
+// ST:   "AK-47（StatTrak™） | 翔鹤 (久经沙场)"
+// SV:   "AK-47（纪念品） | 翔鹤 (久经沙场)"
+displayName = skinName.replace(/\s*\([^)]*\)\s*$/, ''); // 去默认磨损
+if (stattrak) displayName = displayName.replace(' | ', '（StatTrak™） | ');
+if (souvenir) displayName = displayName.replace(' | ', '（纪念品） | ');
+displayName += ' (' + classifyWear(actualWear).nameZh + ')';
+```
+
+**手动规格 API:**
+
+```js
+// sim = new TradeUpSimulator(allData);  // 初始化一次, 复用无限次
+sim.simulateBySpec([
+  { paintIndex: 836, weaponId: 7, wearFloat: 0.228, stattrak: false },
+  // ... ×10
+]);
+```
+
+---
+
+### 模块 4: RecipeManager — 配方管理
+
+文件: `lib/recipe-manager.js`。
+
+**配方 JSON 标准格式 (不可更改):**
+
+```json
+{
+  "name": "10× 军规级 → 受限",
+  "type": "virtual",
+  "rarity": "军规级",
+  "targetRarity": "受限级",
+  "items": [
+    { "paintIndex": 836, "weaponId": 7, "wearFloat": 0.228, "assetId": null }
+  ],
+  "simulation": { "avgWearNorm": 0.397, "outcomes": [...] },
+  "createdAt": "2026-06-20T..."
+}
+```
+
+- `type: "virtual"` = 虚假配方 (无 assetId, 可模拟不可执行)
+- `type: "real"` = 真实配方 (有 assetId, 可模拟也可执行)
+- 混合配方 (部分有 assetId 部分无) 必须报错
+
+---
+
+### 模块 5: 登录与 Token 持久化
+
+文件: `index.js` §1, §8。
+
+**范式 (不可更改逻辑):**
+
+```
+启动 → 读 data/tokens.json[accountName]
+  ├─ 有 → logOn({ refreshToken })  // 免密免2FA
+  └─ 无 → logOn({ accountName, password })
+       ├─ 'steamGuard' 事件 → 用户输入验证码
+       └─ 'refreshToken' 事件 → 写入 tokens.json
+
+client.on('error') / client.on('disconnected'):
+  if eresult === 84 || InvalidToken/Expired →
+    delete savedTokens[accountName]  // 自动清除, 下次降级密码
+```
+
+**代理:** `.env` → `SOCKS_PROXY`/`HTTP_PROXY` → `client.options`。
+`webCompatibilityMode: true` 强制 WebSocket:443。
+
+---
+
+### 模块 6: 汰换执行引擎
+
+文件: `index.js` `connectedToGC` 处理器。
+
+**范式 (不可更改):**
+
+```
+--trade-up=id1,...,id10;id11,...,id20
+  → 分号分隔多组 → 每组验证10件
+  → 顺序执行 (递归 next())
+  → 每组: 定位物品 → 稀有度验证 → 推断recipe → csgo.craft()
+  → 组间 500ms 间隔 (防GC限速)
+  → 失败不中断后续组
+```
+
+---
+
+### 模块 7: CLI 命令体系
+
+所有命令的精确行为 (不可更改):
+
+```bash
+# 库存导出 (需 Steam + GC)
+node index.js                          # Token优先 → 密码降级
+node index.js --password               # 强制密码
+
+# 真实汰换 (需 Steam + GC)
+node index.js --trade-up=id1,...,id10                     # 单组
+node index.js --trade-up=id1,...,id10;id11,...,id20       # 多组
+
+# 模拟 (纯本地, 不连Steam)
+node index.js --sim-by-spec=file.json                     # 手动规格文件
+node index.js --sim-by-spec=file.json --save-recipe=name  # 保存为配方
+node index.js --sim-trade-up=id1,...,id10                 # 库存物品
+node index.js --load-recipe=file.json                     # 加载配方+模拟
+node index.js --list-recipes                              # 列出配方
+
+# 执行 (需 Steam + GC)
+node index.js --execute-recipe=file.json                  # 加载真实配方+执行
+```
+
+**SIM 模式早退规则:** `--sim-by-spec` / `--sim-trade-up` / `--load-recipe`
+/ `--list-recipes` 在 `CsgoResolver` 初始化后立即执行并 `process.exit(0)`,
+**绝不**连接 Steam。
+
+---
+
+### 模块 8: 数据下载
+
+文件: `generate_dict.js`。
+
+下载目标:
+1. `data/all.json` (zh-CN, ~71MB) — 从 CSGO-API
+2. `data/game/items_game.txt` (~6.6MB) — 从 skinledger.com
+3. `data/game/csgo_english.txt` (~3.6MB) — 翻译文件
+
+```bash
+node generate_dict.js --force          # 强制下载最新
+```
+
+---
+
 ## Common Patterns
 
 ### Login + Token 持久化 (完整生产级)
