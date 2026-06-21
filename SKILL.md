@@ -107,7 +107,7 @@ cs2tradetool/
    `stickers[0].sticker_id` 才是真实身份。512 件物品共用 `def_index=1209` 但有
    101 种不同 `sticker_id` 证实了这一点。
 2. **all.json 是唯一数据源** — 不允许多文件回退到旧的 CSGO-API 分散文件。
-3. **三路分派规则不可更改顺序** — `stickers[0]` → `paint_index` → `isWeapon`
+3. **约束制引擎不可降级为计分制** — TYPE_RULES 定义每种物品的 required/forbidden 特征，全部满足才确认。不可回到 if/else 顺序分派。
 4. **类别搜索必须用单数形式** — `crate` 非 `crates`, 匹配 all.json key 前缀。
 5. **items_game.txt 断层回退不可移除** — 填补 CSGO-API 贴纸断层 (1695-1738 等)。
 6. **磨损输入必须校验合法性** — `wearFloat ∈ [minFloat, maxFloat]`, 否则拒绝。
@@ -191,61 +191,82 @@ this.getStickerName = (id) => translate(this.stickerKits[id]?.item_name);
 
 ---
 
-### 模块 2: 三路分派 — GC 物品识别核心
+### 模块 2: 约束制匹配引擎 — GC 物品识别核心
 
-**此逻辑从 GC 原始 CSOEconItem 到最终名称, 顺序不可更改:**
+文件: `lib/item-matcher.js`。**不再使用顺序分派或计分制。**
+
+每种物品类型在 `TYPE_RULES` 中定义两组特征:
+- `required`: **必须全部满足** — 任一项不满足 → 拒绝此类型
+- `forbidden`: **绝对不能出现** — 任一项出现 → 拒绝此类型
+
+**完整规则表 (不可更改):**
+
+| 类型 | required | forbidden |
+|------|----------|-----------|
+| skin | hasPaint | hasGraffitiTint, hasMusicIndex |
+| weapon | isWeapon | hasPaint, hasGraffitiTint, hasMusicIndex |
+| sticker | hasSticker | hasGraffitiTint, hasMusicIndex, hasPaint |
+| graffiti | hasGraffitiTint | (无) |
+| music_kit | hasMusicIndex | hasPaint |
+| crate | inCrateDefRange | hasSticker, hasPaint, hasMusicIndex, hasGraffitiTint |
+| collectible | inCollectibleDefRange | hasPaint, hasMusicIndex, hasGraffitiTint |
+| agent | inAgentDefRange | hasPaint, hasMusicIndex, hasGraffitiTint |
+| keychain | inKeychainDefRange | hasPaint, hasSticker, hasMusicIndex, hasGraffitiTint |
+| patch | inPatchDefRange | hasPaint, hasMusicIndex, hasGraffitiTint |
+
+**匹配流程 (不可更改):**
 
 ```
 CSOEconItem
   │
-  ├─ hasAppliedSticker = item.stickers && item.stickers.length > 0
-  │   YES → 真实身份 = item.stickers[0].sticker_id
-  │         名称 = resolver.resolveSticker(stickerId)
-  │         失败 → "印花 #{stickerId}"
+  ├─ Phase 1: _collectSignals() — 收集 14 种特征信号
+  │     hasSticker, hasPaint, hasWear, isWeapon,
+  │     hasMusicIndex, hasGraffitiTint, isStatTrak, isSouvenir, ...
   │
-  ├─ item.paint_index != null && item.paint_index !== 0
-  │   YES → 武器皮肤. Key = String(paint_index) + "|" + weapon_id
-  │         名称 = resolver.resolveSkin(paintIndex, weaponId)
-  │         磨损 = classifyWear(item.paint_wear)
+  ├─ Phase 2: 并行检查所有 TYPE_RULES
+  │     for each type:
+  │       required 全部满足? AND forbidden 无一违反?
+  │       → YES: 加入候选列表
+  │       → NO:  直接拒绝
   │
-  ├─ resolver.isKnownWeapon(item.def_index)
-  │   YES → 原版武器 (无涂装)
+  ├─ Phase 3: 多候选时按精度基数选择
+  │     agent(159) > music_kit(53) > crate(20.9)
+  │     > collectible(15.9) > graffiti(4.7) > sticker(0.96)
   │
-  └─ 否则 → 箱子/收藏品/探员/涂鸦
-           从 all.json 按类别精度计分:
-           10000 / categoryKeyCount — 条目越少权重越高
-           crate(478条)=20.9 >> sticker(10441条)=0.96
+  └─ Phase 4: 名称解析
+        skin → paint_index|weapon_id → all.json
+        sticker → sticker_id → all.json / items_game.txt 回退
+        graffiti → all.json key: graffiti-{sticker_id}_{tint_id}
+        music_kit → music_index → all.json
+        crate/collectible/agent → def_index → all.json
 ```
 
-**类别精度计分表 (不可更改):**
+**约束制 vs 旧计分制 (关键区别):**
 
-| 类别 | 条目数 | 精度分 |
-|------|-------|--------|
-| tool | 4 | 2500 |
-| key | 39 | 256 |
-| agent | 63 | 159 |
-| music_kit | 189 | 53 |
-| crate | 478 | 20.9 |
-| collectible | 627 | 15.9 |
-| graffiti | 2111 | 4.7 |
-| sticker/sticker_slab | 10441 | 0.96 |
+| 场景 | 旧计分制 | 约束制 |
+|------|---------|--------|
+| def=1349, 有 sticker+graffiti_tint | sticker +25, graffiti +50 → 比分数 | graffiti 匹配 ✅, sticker 因 forbidden=hasGraffitiTint 被拒 |
+| def=4799, 有 sticker, no paint | sticker +25, collectible -10 → sticker 赢 | collectible 匹配 ✅, sticker 因 forbidden=hasPaint/hasGraffitiTint 不全满足仍被拒 |
+| def=4236, no sticker, no paint | 精度分排序: crate 20.9 > collectible 15.9 | crate 匹配 ✅ |
+
+**特征信号的真相:**
+
+- `hasSticker` = `item.stickers && item.stickers.length > 0` — 物品有 applied sticker
+- `hasGraffitiTint` = `attribute[233]` 存在 — 这是涂鸦容器的身份编码，不是"贴纸"
+- `hasMusicIndex` = `attribute[166]` 存在 — 音乐盒的身份编码
+- `hasPaint` = `item.paint_index != null && item.paint_index !== 0`
+- `isWeapon` = `def_index` 在武器 ID 集合中 (all.json skin 条目 + items_game.txt baseitem==1)
+- `inCrateDefRange` = `def_index` 在 all.json crate 条目中，且不在 sticker 条目中（或精度更高）
 
 **StatTrak/Souvenir 检测与名称格式化 (不可更改):**
 
-检测逻辑 — 三重判断:
 ```js
-const isST = item.quality === 9
-  || item.kill_eater_value != null
+const isST = item.quality === 9 || item.kill_eater_value != null
   || (item.attribute || []).some(a => a.def_index === 80);
-
 const isSV = item.quality === 12
   || (item.attribute || []).some(a => a.def_index === 140);
-if (isST) entry.stattrak = true;
-if (isSV) entry.souvenir = true;
-```
 
-名称格式化 — 与 all.json 格式严格一致:
-```js
+// 名称格式化 — 与 all.json 格式严格一致
 // ST: "AK-47 | 精英之作" → "AK-47（StatTrak™） | 精英之作"
 // SV: "AK-47 | 精英之作" → "AK-47（纪念品） | 精英之作"
 if (entry.name) {
@@ -255,6 +276,25 @@ if (entry.name) {
 ```
 
 杀敌数: `item.kill_eater_value != null` → `entry.stattrakKills = item.kill_eater_value`。
+
+**processInventory 范式代码 (不可改结构):**
+
+```js
+function processInventory(rawItems) {
+  for (const item of rawItems) {
+    if (item.casket_id) continue;
+    const match = matcher.match(item);        // 约束制引擎判定类型
+    entry.itemType = match.itemType;
+
+    if (match.itemType === 'skin') { /* paint_index|weapon_id → all.json */ }
+    else if (match.itemType === 'sticker') { /* sticker_id → all.json / fallback */ }
+    else if (match.itemType === 'graffiti') { /* graffiti-{sticker_id}_{tint} → all.json */ }
+    else if (match.itemType === 'music_kit') { /* music_index → all.json */ }
+    else if (match.itemType === 'weapon') { /* 原版武器 */ }
+    else { /* crate/collectible/agent → def_index → all.json */ }
+  }
+}
+```
 
 ---
 
