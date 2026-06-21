@@ -366,6 +366,100 @@ const name = translate(stickerKits[stickerId].item_name);  // e.g. "GTG"
 this.getGraffitiName(stickerId, tintId);  // "涂鸦 | GTG (shark white)"
 ```
 
+### 约束制引擎 — 完整源代码 (lib/item-matcher.js)
+
+```js
+// 每种类型的约束规则
+const TYPE_RULES = {
+  skin:        { required: ['hasPaint'],              forbidden: ['hasGraffitiTint','hasMusicIndex'] },
+  weapon:      { required: ['isWeapon'],              forbidden: ['hasPaint','hasGraffitiTint','hasMusicIndex'] },
+  sticker:     { required: ['hasSticker'],            forbidden: ['hasGraffitiTint','hasMusicIndex','hasPaint'] },
+  graffiti:    { required: ['hasGraffitiTint'],       forbidden: [] },
+  music_kit:   { required: ['hasMusicIndex'],         forbidden: ['hasPaint'] },
+  crate:       { required: ['inCrateDefRange'],       forbidden: ['hasSticker','hasPaint','hasMusicIndex','hasGraffitiTint'] },
+  collectible: { required: ['inCollectibleDefRange'], forbidden: ['hasPaint','hasMusicIndex','hasGraffitiTint'] },
+  agent:       { required: ['inAgentDefRange'],       forbidden: ['hasPaint','hasMusicIndex','hasGraffitiTint'] },
+  keychain:    { required: ['inKeychainDefRange'],    forbidden: ['hasPaint','hasSticker','hasMusicIndex','hasGraffitiTint'] },
+  patch:       { required: ['inPatchDefRange'],       forbidden: ['hasPaint','hasMusicIndex','hasGraffitiTint'] },
+  music_kit_by_index: { exclusive: true, required: ['hasMusicIndex'], forbidden: ['hasPaint'] },
+};
+
+class ItemMatcher {
+  constructor(resolver) { this.resolver = resolver; }
+
+  match(item) {
+    const sig = this._collectSignals(item);
+    const matched = [];
+    for (const [typeName, rules] of Object.entries(TYPE_RULES)) {
+      if (typeName === 'music_kit_by_index') continue;
+      if (this._checkRules(rules, sig)) {
+        matched.push({ type: typeName, specificity: SPECIFICITY[typeName] || 1 });
+      }
+    }
+    // 独占: music_kit_by_index
+    if (this._checkRules(TYPE_RULES.music_kit_by_index, sig)) {
+      const mkMatch = matched.find(m => m.type === 'music_kit');
+      matched.length = 0;
+      if (mkMatch) matched.push(mkMatch);
+      matched.push({ type: 'music_kit', specificity: 100 });
+    }
+    if (matched.length > 0) {
+      matched.sort((a, b) => b.specificity - a.specificity);
+      const best = matched[0];
+      // sticker vs graffiti: graffiti 优先
+      const hasG = matched.some(m => m.type === 'graffiti');
+      const hasS = matched.some(m => m.type === 'sticker');
+      if (hasG && hasS && best.type === 'sticker') {
+        best.type = 'graffiti';
+      }
+      return { itemType: best.type === 'music_kit_by_index' ? 'music_kit' : best.type,
+               _matchScore: best.specificity, _matchDetail: 'constraint-matched', _validated: true };
+    }
+    // 兜底: def_index
+    const allTypes = this.resolver.resolveAllTypes(item.def_index);
+    const nonSticker = allTypes.filter(t => t.type !== 'sticker' && t.type !== 'sticker_slab');
+    const best = nonSticker.length > 0 ? nonSticker[0] : allTypes[0];
+    return { itemType: best?.type || 'unknown', _matchScore: -100, _matchDetail: 'fallback' };
+  }
+
+  _collectSignals(item) {
+    const attrs = item.attribute || [];
+    return {
+      hasSticker: !!(item.stickers && item.stickers.length > 0),
+      hasPaint: !!(item.paint_index != null && item.paint_index !== 0),
+      hasWear: item.paint_wear != null,
+      hasMusicIndex: attrs.some(a => a.def_index === 166),
+      musicIndex: getAttrValue(item, 166),
+      hasGraffitiTint: attrs.some(a => a.def_index === 233),
+      isWeapon: this.resolver.isKnownWeapon(item.def_index),
+    };
+  }
+
+  _checkRules(rules, sig) {
+    for (const req of (rules.required || [])) if (!this._evalFeature(req, sig)) return false;
+    for (const forbid of (rules.forbidden || [])) if (this._evalFeature(forbid, sig)) return false;
+    return true;
+  }
+
+  _evalFeature(feature, sig) {
+    switch (feature) {
+      case 'hasPaint':          return sig.hasPaint;
+      case 'hasSticker':        return sig.hasSticker;
+      case 'hasWear':           return sig.hasWear;
+      case 'hasMusicIndex':     return sig.hasMusicIndex;
+      case 'hasGraffitiTint':   return sig.hasGraffitiTint;
+      case 'isWeapon':          return sig.isWeapon;
+      case 'inCrateDefRange':   return !!this.resolver.resolveByDef('crate', sig.defIndex);
+      case 'inCollectibleDefRange': return !!this.resolver.resolveByDef('collectible', sig.defIndex);
+      case 'inAgentDefRange':   return !!this.resolver.resolveByDef('agent', sig.defIndex);
+      case 'inKeychainDefRange': return !!this.resolver.resolveByDef('keychain', sig.defIndex);
+      case 'inPatchDefRange':   return !!this.resolver.resolveByDef('patch', sig.defIndex);
+      default: return false;
+    }
+  }
+}
+```
+
 ### 单复数陷阱
 
 all.json 的 key 前缀使用**单数形式**: `crate`, `agent`, `graffiti`, `collectible` 等。
